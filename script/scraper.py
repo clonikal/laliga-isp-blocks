@@ -27,10 +27,10 @@ HTTP_TIMEOUT: Final[float] = 45.0
 OPENWRT_INTERFACE: Final[str] = "cloudflare"
 OPENWRT_METRIC: Final[int] = 256
 
-OPENWRT_ROUTE4_IDX_RE = re.compile(r"^network.@route\[([0-9]+)\]")
-OPENWRT_ROUTE6_IDX_RE = re.compile(r"^network.@route6\[([0-9]+)\]")
-OPENWRT_ROUTE4_RE = re.compile(r"^network.@route\[[0-9]+\]")
-OPENWRT_ROUTE6_RE = re.compile(r"^network.@route6\[[0-9]+\]")
+OPENWRT_ROUTE4_IDX_RE = re.compile(r"^network\.@route\[(\d+)\]")
+OPENWRT_ROUTE6_IDX_RE = re.compile(r"^network\.@route6\[(\d+)\]")
+OPENWRT_ROUTE4_RE = re.compile(r"^network\.@route\[(\d+)\]\.(\w+)=['\"]?(.*?)['\"]?$")
+OPENWRT_ROUTE6_RE = re.compile(r"^network\.@route6\[(\d+)\]\.(\w+)=['\"]?(.*?)['\"]?$")
 
 OPT_ARGS: list[str]
 OPT_OPTS: optparse.Values
@@ -291,86 +291,141 @@ class OpenWrtRoute:
 
 
 def openwrt_routes_add(laliga: LaLigaGate, ssh: paramiko.SSHClient) -> None:
-    """OpenWrt add routes."""
+    """OpenWrt add routes safely using stdin."""
     routes: dict[str, OpenWrtRoute] = {}
     routes_v4, routes_v6 = openwrt_routes_get(ssh)
 
     for route in routes_v4:
-        route_ip = str(route.get_ip())
-        routes[route_ip] = route
+        if route.get_ip():
+            routes[str(route.get_ip())] = route
     for route in routes_v6:
-        route_ip = str(route.get_ip())
-        routes[route_ip] = route
+        if route.get_ip():
+            routes[str(route.get_ip())] = route
 
+    commands: list[str] = []
     new_routes = 0
+
     for ipv4 in laliga.ipv4_list:
         ipv4_str = str(ipv4)
-        if ipv4_str not in routes:
-            new_routes += 1
-            uci = "uci batch << EOI\n"
-            uci += "add network route\n"
-            uci += f"set network.@route[-1].interface='{OPENWRT_INTERFACE}'\n"
-            uci += f"set network.@route[-1].target='{ipv4_str}/32'\n"
-            uci += f"set network.@route[-1].metric='{OPENWRT_METRIC}'\n"
-            uci += "EOI"
-            _LOGGER.warning("openwrt_add: new IPv4 -> %s", ipv4_str)
-            ssh.exec_command(uci)
+        
+        if ipv4_str in routes:
+            existing = routes[ipv4_str]
+            _LOGGER.debug(f"Skipping IP {ipv4_str}, already exists on interface {existing.interface}")
+            continue
+
+        new_routes += 1
+        commands.append("add network route")
+        commands.append(f"set network.@route[-1].interface='{OPENWRT_INTERFACE}'")
+        commands.append(f"set network.@route[-1].target='{ipv4_str}/32'")
+        commands.append(f"set network.@route[-1].metric='{OPENWRT_METRIC}'")
+        _LOGGER.warning("openwrt_add: adding IPv4 -> %s", ipv4_str)
+
     for ipv6 in laliga.ipv6_list:
         ipv6_str = str(ipv6)
-        if ipv6_str not in routes:
-            new_routes += 1
-            uci = "uci batch << EOI\n"
-            uci += "add network route6\n"
-            uci += f"set network.@route6[-1].interface='{OPENWRT_INTERFACE}'\n"
-            uci += f"set network.@route6[-1].target='{ipv6_str}/128'\n"
-            uci += f"set network.@route6[-1].metric='{OPENWRT_METRIC}'\n"
-            uci += "EOI"
-            _LOGGER.warning("openwrt_add: new IPv6 -> %s", ipv6_str)
-            ssh.exec_command(uci)
+        if ipv6_str in routes:
+            existing = routes[ipv6_str]
+            _LOGGER.debug(f"Skipping IP {ipv6_str}, already exists on interface {existing.interface}")
+            continue
+
+        new_routes += 1
+        commands.append("add network route6")
+        commands.append(f"set network.@route6[-1].interface='{OPENWRT_INTERFACE}'")
+        commands.append(f"set network.@route6[-1].target='{ipv6_str}/128'")
+        commands.append(f"set network.@route6[-1].metric='{OPENWRT_METRIC}'")
+        _LOGGER.warning("openwrt_add: adding IPv6 -> %s", ipv6_str)
 
     if new_routes > 0:
-        ssh.exec_command("uci commit network")
-        ssh.exec_command("reload_config")
-        _LOGGER.warning("OpenWrt: added %s new routes", new_routes)
+        _LOGGER.info(f"OpenWrt: sending {new_routes} new routes to OpenWrt...")
+        
+        stdin, stdout, stderr = ssh.exec_command("uci batch")
+        
+        full_batch = "\n".join(commands) + "\ncommit network\n"
+        stdin.write(full_batch)
+        stdin.flush()
+        stdin.channel.shutdown_write()
+        
+        exit_status = stdout.channel.recv_exit_status()
+        if exit_status == 0:
+            _, stdout_reload, _ = ssh.exec_command("reload_config")
+            _LOGGER.warning("OpenWrt: added %s new routes successfully", new_routes)
+        else:
+            err = stderr.read().decode()
+            _LOGGER.error("OpenWrt: error adding routes: %s", err)
+    else:
+        _LOGGER.info("There are no new routes to add.")
 
 
 def openwrt_routes_get(
     ssh: paramiko.SSHClient,
 ) -> tuple[list[OpenWrtRoute], list[OpenWrtRoute]]:
-    """OpenWrt get routes."""
+    """OpenWrt get routes robustly with Regex."""
     stdin, stdout, stderr = ssh.exec_command("uci show network")
-    routes_v4: list[OpenWrtRoute] = []
-    routes_v6: list[OpenWrtRoute] = []
-    cur_route: OpenWrtRoute
+    
+    routes_v4_map: dict[int, OpenWrtRoute] = {}
+    routes_v6_map: dict[int, OpenWrtRoute] = {}
+
     for line in stdout:
-        val = None
+        line = line.strip()
+        if not line:
+            continue
 
-        if OPENWRT_ROUTE4_RE.match(line):
-            val = OPENWRT_ROUTE4_RE.split(line)[1]
-            if val.startswith("=route"):
-                route_idx = OPENWRT_ROUTE4_IDX_RE.match(line).group(1)
-                cur_route = OpenWrtRoute(IPv4Network, route_idx)
-                routes_v4.append(cur_route)
-                val = None
-        elif OPENWRT_ROUTE6_RE.match(line):
-            val = OPENWRT_ROUTE6_RE.split(line)[1]
-            if val.startswith("=route6"):
-                route_idx = OPENWRT_ROUTE6_IDX_RE.match(line).group(1)
-                cur_route = OpenWrtRoute(IPv6Network, route_idx)
-                routes_v6.append(cur_route)
-                val = None
+        # Detect IPv4
+        val_match_v4 = OPENWRT_ROUTE4_RE.match(line)
+        if val_match_v4:
+            idx = int(val_match_v4.group(1))
+            prop = val_match_v4.group(2)
+            val = val_match_v4.group(3)
+            if idx not in routes_v4_map:
+                routes_v4_map[idx] = OpenWrtRoute(IPv4Network, idx)
+            routes_v4_map[idx].set_uci_value(f".{prop}='{val}'")
+            continue
+        
+        idx_match_v4 = OPENWRT_ROUTE4_IDX_RE.match(line)
+        if idx_match_v4 and "=" in line and not "." in line.split("=")[0]:
+             idx = int(idx_match_v4.group(1))
+             if idx not in routes_v4_map:
+                routes_v4_map[idx] = OpenWrtRoute(IPv4Network, idx)
+             continue
 
-        if val is not None:
-            cur_route.set_uci_value(val)
+        # Detect IPv6
+        val_match_v6 = OPENWRT_ROUTE6_RE.match(line)
+        if val_match_v6:
+            idx = int(val_match_v6.group(1))
+            prop = val_match_v6.group(2)
+            val = val_match_v6.group(3)
+            if idx not in routes_v6_map:
+                routes_v6_map[idx] = OpenWrtRoute(IPv6Network, idx)
+            routes_v6_map[idx].set_uci_value(f".{prop}='{val}'")
+            continue
+            
+        idx_match_v6 = OPENWRT_ROUTE6_IDX_RE.match(line)
+        if idx_match_v6 and "=" in line and not "." in line.split("=")[0]:
+             idx = int(idx_match_v6.group(1))
+             if idx not in routes_v6_map:
+                routes_v6_map[idx] = OpenWrtRoute(IPv6Network, idx)
+             continue
+
+    for r in routes_v4_map.values():
+        if r.get_ip():
+            _LOGGER.debug(f"Detected IPv4 route: {r.get_ip()} in {r.interface} metric {r.metric}")
+
+    for r in routes_v6_map.values():
+        if r.get_ip():
+            _LOGGER.debug(f"Detected IPv6 route: {r.get_ip()} in {r.interface} metric {r.metric}")
+
+    routes_v4 = [routes_v4_map[k] for k in sorted(routes_v4_map.keys())]
+    routes_v6 = [routes_v6_map[k] for k in sorted(routes_v6_map.keys())]
 
     return routes_v4, routes_v6
 
 
 def openwrt_routes_rem(laliga: LaLigaGate, ssh: paramiko.SSHClient) -> None:
-    """OpenWrt add routes."""
+    """OpenWrt remove routes safely using stdin."""
     routes_v4, routes_v6 = openwrt_routes_get(ssh)
 
+    commands: list[str] = []
     rem_routes = 0
+
     for route in reversed(routes_v4):
         if not route.is_laliga():
             continue
@@ -378,9 +433,9 @@ def openwrt_routes_rem(laliga: LaLigaGate, ssh: paramiko.SSHClient) -> None:
         route_ip = route.get_ip()
         if route_ip not in laliga.ipv4_list:
             rem_routes += 1
-            uci = f"uci delete network.@route[{route.index}]\n"
-            _LOGGER.warning("openwrt_remove: removed IPv4 -> %s", route_ip)
-            ssh.exec_command(uci)
+            commands.append(f"delete network.@route[{route.index}]")
+            _LOGGER.warning("openwrt_remove: removing IPv4 -> %s", route_ip)
+
     for route in reversed(routes_v6):
         if not route.is_laliga():
             continue
@@ -388,15 +443,30 @@ def openwrt_routes_rem(laliga: LaLigaGate, ssh: paramiko.SSHClient) -> None:
         route_ip = route.get_ip()
         if route_ip not in laliga.ipv6_list:
             rem_routes += 1
-            uci = f"uci delete network.@route6[{route.index}]\n"
-            _LOGGER.warning("openwrt_remove: removed IPv6 -> %s", route_ip)
-            ssh.exec_command(uci)
+            commands.append(f"delete network.@route6[{route.index}]")
+            _LOGGER.warning("openwrt_remove: removing IPv6 -> %s", route_ip)
 
     if rem_routes > 0:
-        ssh.exec_command("uci commit network")
-        ssh.exec_command("reload_config")
-        _LOGGER.warning("OpenWrt: removed %s routes", rem_routes)
+        _LOGGER.info(f"OpenWRT: sending {rem_routes} delete commands to OpenWrt...")
 
+        stdin, stdout, stderr = ssh.exec_command("uci batch")
+        
+        full_batch = "\n".join(commands) + "\ncommit network\n"
+        stdin.write(full_batch)
+        stdin.flush()
+        stdin.channel.shutdown_write()
+        
+        exit_status = stdout.channel.recv_exit_status()
+        if exit_status == 0:
+            _, stdout_reload, _ = ssh.exec_command("reload_config")
+            stdout_reload.channel.recv_exit_status()          
+            _LOGGER.warning("OpenWrt: removed %s routes successfully", rem_routes)
+        else:
+            err = stderr.read().decode()
+            _LOGGER.error("OpenWrt: error removing routes: %s", err)
+    else:
+        _LOGGER.info("There are no routes to remove.")
+        
 
 def openwrt(laliga: LaLigaGate) -> None:
     """OpenWrt function."""
@@ -407,6 +477,7 @@ def openwrt(laliga: LaLigaGate) -> None:
         return
 
     ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy()) # Added for safety
     ssh.load_system_host_keys()
     ssh.connect(
         hostname=hostname,
@@ -427,14 +498,23 @@ def scraper() -> LaLigaGate:
 
     laliga = LaLigaGate()
 
-    with open(json_list_fn, mode="r") as json_list:
-        json_data = json.load(json_list)
-        laliga.update_local(json_data)
+    if os.path.exists(json_list_fn):
+        with open(json_list_fn, mode="r") as json_list:
+            try:
+                json_data = json.load(json_list)
+                laliga.update_local(json_data)
+            except json.JSONDecodeError:
+                _LOGGER.error("JSON local corrupto, ignorando.")
 
     url = "https://hayahora.futbol/estado/data.json"
-    response: requests.Response = requests.get(url, timeout=HTTP_TIMEOUT)
-    data = response.json()
-    laliga.update_sources(data)
+    try:
+        response: requests.Response = requests.get(url, timeout=HTTP_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        laliga.update_sources(data)
+    except requests.RequestException as e:
+        _LOGGER.error(f"Error descargando datos: {e}")
+        return laliga
 
     with open(json_list_fn, mode="w", encoding="utf-8") as json_list:
         json_data = json.dumps(
@@ -465,7 +545,7 @@ def scraper() -> LaLigaGate:
                 "config route6\n",
                 f"\toption interface '{OPENWRT_INTERFACE}'\n",
                 f"\toption target '{cur_ipv6}/128'\n",
-                f"option metric '{OPENWRT_METRIC}'\n",
+                f"\toption metric '{OPENWRT_METRIC}'\n",
                 "\n",
             ]
             openwrt_routes.writelines(cur_route)
@@ -476,6 +556,9 @@ def scraper() -> LaLigaGate:
 def main() -> None:
     """Entry function."""
     global OPT_OPTS, OPT_ARGS
+    
+    # Basic logging setup
+    logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
     parser = optparse.OptionParser()
     parser.add_option("--blocked", action="store_true")
