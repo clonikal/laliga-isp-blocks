@@ -1,0 +1,17 @@
+services:
+  laliga-bot:
+    build: .
+    container_name: laliga-scraper
+    restart: unless-stopped
+    environment:
+      # The Docker gateway IP is usually the router's IP
+      # If using 'host' networking, use 127.0.0.1 or the LAN IP (e.g., 192.168.1.1)
+      - TZ=Europe/Madrid
+      - ROUTER_IP=192.168.31.1
+      - CHECK_INTERVAL=600
+      - EXTRA_PARAMS=--isp movistar
+    volumes:
+      # Data persistence (to avoid losing the IP history)
+      - ./data:/data
+      # IMPORTANT! We set up the private key to access the router
+      - ./id_rsa/id_rsa:/root/.ssh/id_rsa:ro
