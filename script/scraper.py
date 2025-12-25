@@ -347,6 +347,7 @@ def openwrt_routes_add(laliga: LaLigaGate, ssh: paramiko.SSHClient) -> None:
         exit_status = stdout.channel.recv_exit_status()
         if exit_status == 0:
             _, stdout_reload, _ = ssh.exec_command("reload_config")
+            stdout_reload.channel.recv_exit_status()
             _LOGGER.warning("OpenWrt: added %s new routes successfully", new_routes)
         else:
             err = stderr.read().decode()
@@ -459,7 +460,7 @@ def openwrt_routes_rem(laliga: LaLigaGate, ssh: paramiko.SSHClient) -> None:
         exit_status = stdout.channel.recv_exit_status()
         if exit_status == 0:
             _, stdout_reload, _ = ssh.exec_command("reload_config")
-            stdout_reload.channel.recv_exit_status()          
+            stdout_reload.channel.recv_exit_status()
             _LOGGER.warning("OpenWrt: removed %s routes successfully", rem_routes)
         else:
             err = stderr.read().decode()
