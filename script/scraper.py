@@ -496,6 +496,7 @@ def scraper() -> LaLigaGate:
     base_dir = os.path.abspath(os.path.dirname(__file__) + os.path.sep + os.path.pardir)
     data_dir = os.path.abspath(base_dir + os.path.sep + "data")
     json_list_fn = os.path.abspath(data_dir + os.path.sep + "laliga-ip-list.json")
+    raw_data_fn = os.path.abspath(data_dir + os.path.sep + "data.json")
 
     laliga = LaLigaGate()
 
@@ -505,16 +506,28 @@ def scraper() -> LaLigaGate:
                 json_data = json.load(json_list)
                 laliga.update_local(json_data)
             except json.JSONDecodeError:
-                _LOGGER.error("JSON local corrupto, ignorando.")
+                _LOGGER.error("Local JSON corrupted, ignoring.")
 
-    url = "https://hayahora.futbol/estado/data.json"
+    current_ts = int(datetime.now().timestamp())
+    url = f"https://hayahora.futbol/estado/data.json?t={current_ts}"
+    headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0"
+    }
     try:
-        response: requests.Response = requests.get(url, timeout=HTTP_TIMEOUT)
+        response: requests.Response = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
         response.raise_for_status()
         data = response.json()
+        try:
+            with open(raw_data_fn, mode="w", encoding="utf-8") as raw_file:
+                json.dump(data, raw_file, indent=2, sort_keys=False)
+            _LOGGER.info(f"Raw data file saved to: {raw_data_fn}")
+        except OSError as e:
+            _LOGGER.error(f"Failed to save the raw data.json file: {e}")
         laliga.update_sources(data)
     except requests.RequestException as e:
-        _LOGGER.error(f"Error descargando datos: {e}")
+        _LOGGER.error(f"Error downloading data file: {e}")
         return laliga
 
     with open(json_list_fn, mode="w", encoding="utf-8") as json_list:
