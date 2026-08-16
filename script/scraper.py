@@ -96,9 +96,9 @@ class LaLigaGate:
 
     def update_local(self, json_data: dict[str, Any]):
         """LaLigaGate update from local data."""
-        last_update = json_data.get("last_update")
+        last_update = json_data.get(LAST_UPDATE)
         if last_update is not None:
-            self.last_update = datetime.strptime(last_update, "%Y-%m-%d %H:%M:%S")
+            self.last_update = datetime.strptime(last_update, "%Y-%m-%d %H:%M:%SZ")
 
         ipv4_list = json_data.get("ipv4_list", [])
         for ipv4 in ipv4_list:
@@ -125,7 +125,7 @@ class LaLigaGate:
 
         last_update = json_data.get(LAST_UPDATE)
         if last_update is not None:
-            self.last_update = datetime.strptime(last_update, "%Y-%m-%d %H:%M:%S")
+            self.last_update = datetime.strptime(last_update, "%Y-%m-%d %H:%M:%SZ")
 
         data: list[dict[str, Any]] = json_data.get(DATA, [])
         if len(data) < 1:
